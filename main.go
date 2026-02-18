@@ -831,26 +831,6 @@ func fetchArchivedRepos(org string) (map[string]bool, error) {
 	return archived, nil
 }
 
-// ghRepoArchived checks if a repository is archived.
-//
-// Deprecated: Use fetchArchivedRepos for batch checking at startup.
-// This function remains for backward compatibility but is no longer used by the pipeline.
-func ghRepoArchived(owner, name string) (bool, error) {
-	args := []string{
-		"repo", "view", owner + "/" + name,
-		"--json", "isArchived",
-	}
-	out, err := runCmd("gh", args...)
-	if err != nil {
-		return false, err
-	}
-	var info repoInfo
-	if err := json.Unmarshal(out, &info); err != nil {
-		return false, err
-	}
-	return info.IsArchived, nil
-}
-
 func runCmd(bin string, args ...string) ([]byte, error) {
 	cmd := exec.Command(bin, args...)
 	cmd.Env = os.Environ()
@@ -882,15 +862,6 @@ func isDoNotTouch(labelName string, title string, body string, labels []label) b
 	needle := "do not touch"
 	hay := strings.ToLower(title + "\n" + body)
 	return strings.Contains(hay, needle)
-}
-
-// parseRepoOwnerName splits "owner/name" into owner and name.
-func parseRepoOwnerName(repo string) (owner, name string) {
-	parts := strings.Split(repo, "/")
-	if len(parts) == 2 {
-		return parts[0], parts[1]
-	}
-	return "", ""
 }
 
 func buildCommentBody(pr *prView, reason string) string {
