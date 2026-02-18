@@ -156,10 +156,7 @@ func TestArchivedReposIntegration(t *testing.T) {
 	var processed []string
 
 	for _, pr := range prs {
-		archived := false
-		if batchResult != nil {
-			archived = batchResult[pr.repoName]
-		}
+		archived := batchResult[pr.repoName]
 
 		if archived {
 			skipped = append(skipped, pr.repoName)
