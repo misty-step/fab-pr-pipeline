@@ -54,7 +54,7 @@ func classifyError(err error) ErrorKind {
 		"ref not found",
 		"no such file or directory", // gh CLI not installed
 		"command not found",
-		"could not read username",   // auth issues
+		"could not read username", // auth issues
 		"bad credentials",
 		"invalid credentials",
 		"resource not found",
