@@ -167,6 +167,7 @@ type prOutcome struct {
 	Mergeable      string `json:"mergeable,omitempty"`
 	ReviewDecision string `json:"reviewDecision,omitempty"`
 	ReviewComments string `json:"reviewComments,omitempty"`
+	CIFailureType  string `json:"ciFailureType,omitempty"`
 }
 
 type mergeMutationResponse struct {
@@ -376,6 +377,20 @@ func main() {
 			continue
 		}
 
+		if strings.HasPrefix(mergeReason, "checks_") {
+			outcome.CIFailureType = classifyCIFailure(view.StatusCheckRollup)
+			if outcome.CIFailureType == "lint" && *discordAlertsTo != "" {
+				token := strings.TrimSpace(os.Getenv("DISCORD_BOT_TOKEN"))
+				if token != "" {
+					alertsTo := normalizeDiscordTarget(*discordAlertsTo)
+					msg := fmt.Sprintf("🧹 Lint failure on PR %s (%s#%d). Dispatch lint-fix agent.", view.URL, pr.Repository.NameWithOwner, pr.Number)
+					if err := discordSendMessage(token, alertsTo, msg); err != nil {
+						fmt.Fprintf(os.Stderr, "lint alert send failed: %v\n", err)
+					}
+				}
+			}
+		}
+
 		// Skip archived repos - they're read-only and can't accept comments.
 		// Uses batch-fetched archived repo set (fetched once at startup).
 		// If batch fetch failed (archivedRepos == nil), allow pipeline to continue.
@@ -418,8 +433,12 @@ func main() {
 				cb.RecordFailure(pr.URL)
 			}
 		} else {
-			outcome.Action = "commented"
 			outcome.Reason = mergeReason
+			if outcome.CIFailureType == "lint" {
+				outcome.Action = "lint_dispatched"
+			} else {
+				outcome.Action = "commented"
+			}
 			if mergeReason == "review_changes_requested" {
 				comments, err := ghPRReviewComments(view.URL)
 				if err == nil {
@@ -539,7 +558,7 @@ func summarize(results []prOutcome) (merged int, commented int, skipped int, err
 		switch r.Action {
 		case "merged":
 			merged++
-		case "commented", "review_dispatched":
+		case "commented", "review_dispatched", "lint_dispatched":
 			commented++
 		case "skipped":
 			skipped++
