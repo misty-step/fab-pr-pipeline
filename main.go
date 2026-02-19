@@ -968,6 +968,12 @@ func buildCommentBody(pr *prView, reason string) string {
 		"",
 		"Next action: make checks green and resolve review blockers; rerun pipeline.",
 	}
+	if strings.HasPrefix(reason, "checks_") {
+		ciType := classifyCIFailure(pr.StatusCheckRollup)
+		if ciType == "lint" {
+			lines = append(lines, "🧹 Lint-fix subagent dispatched via Discord for batch dispatch.")
+		}
+	}
 	return strings.Join(lines, "\n")
 }
 
