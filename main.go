@@ -761,7 +761,15 @@ func ghMergePR(pullRequestNodeID string) (string, error) {
 	if strings.TrimSpace(pullRequestNodeID) == "" {
 		return "", errors.New("pull request node id required")
 	}
-	query := `mutation($pullRequestId: ID!) {\n  mergePullRequest(input: { pullRequestId: $pullRequestId, mergeMethod: MERGE }) {\n    pullRequest {\n      merged\n      mergedAt\n      mergeCommit { oid }\n    }\n  }\n}`
+	query := `mutation($pullRequestId: ID!) {
+  mergePullRequest(input: { pullRequestId: $pullRequestId, mergeMethod: MERGE }) {
+    pullRequest {
+      merged
+      mergedAt
+      mergeCommit { oid }
+    }
+  }
+}`
 	args := []string{
 		"api", "graphql",
 		"-f", "query=" + query,
