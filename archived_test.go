@@ -8,44 +8,44 @@ import (
 // TestParseArchivedRepos tests parsing of gh repo list JSON output.
 func TestParseArchivedRepos(t *testing.T) {
 	tests := []struct {
-		name          string
-		jsonInput     string
-		wantArchived  map[string]bool
-		wantErr       bool
+		name         string
+		jsonInput    string
+		wantArchived map[string]bool
+		wantErr      bool
 	}{
 		{
-			name:        "archived and non-archived",
-			jsonInput:   `[{"name":"f","nameWithOwner":"m/f","isArchived":false},{"name":"o","nameWithOwner":"m/o","isArchived":true}]`,
+			name:         "archived and non-archived",
+			jsonInput:    `[{"name":"f","nameWithOwner":"m/f","isArchived":false},{"name":"o","nameWithOwner":"m/o","isArchived":true}]`,
 			wantArchived: map[string]bool{"m/o": true}, wantErr: false,
 		},
 		{
-			name:        "empty list",
-			jsonInput:   `[]`,
+			name:         "empty list",
+			jsonInput:    `[]`,
 			wantArchived: map[string]bool{}, wantErr: false,
 		},
 		{
-			name:        "malformed JSON",
-			jsonInput:   `[{"name": "test", "isArchived":}]`,
+			name:         "malformed JSON",
+			jsonInput:    `[{"name": "test", "isArchived":}]`,
 			wantArchived: nil, wantErr: true,
 		},
 		{
-			name:        "invalid JSON",
-			jsonInput:   `not json`,
+			name:         "invalid JSON",
+			jsonInput:    `not json`,
 			wantArchived: nil, wantErr: true,
 		},
 		{
-			name:        "all archived",
-			jsonInput:   `[{"name":"l","nameWithOwner":"m/l","isArchived":true}]`,
+			name:         "all archived",
+			jsonInput:    `[{"name":"l","nameWithOwner":"m/l","isArchived":true}]`,
 			wantArchived: map[string]bool{"m/l": true}, wantErr: false,
 		},
 		{
-			name:        "multiple archived repos",
-			jsonInput:   `[{"name":"a","nameWithOwner":"org/a","isArchived":true},{"name":"b","nameWithOwner":"org/b","isArchived":true},{"name":"c","nameWithOwner":"org/c","isArchived":false}]`,
+			name:         "multiple archived repos",
+			jsonInput:    `[{"name":"a","nameWithOwner":"org/a","isArchived":true},{"name":"b","nameWithOwner":"org/b","isArchived":true},{"name":"c","nameWithOwner":"org/c","isArchived":false}]`,
 			wantArchived: map[string]bool{"org/a": true, "org/b": true}, wantErr: false,
 		},
 		{
-			name:        "repo with special characters",
-			jsonInput:   `[{"name":"my-repo","nameWithOwner":"org/my-repo","isArchived":true}]`,
+			name:         "repo with special characters",
+			jsonInput:    `[{"name":"my-repo","nameWithOwner":"org/my-repo","isArchived":true}]`,
 			wantArchived: map[string]bool{"org/my-repo": true}, wantErr: false,
 		},
 	}

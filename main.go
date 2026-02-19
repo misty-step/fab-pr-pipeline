@@ -164,6 +164,7 @@ type prOutcome struct {
 	ChecksState    string `json:"checksState,omitempty"`
 	Mergeable      string `json:"mergeable,omitempty"`
 	ReviewDecision string `json:"reviewDecision,omitempty"`
+	ReviewComments string `json:"reviewComments,omitempty"`
 }
 
 type mergeMutationResponse struct {
@@ -417,6 +418,21 @@ func main() {
 		} else {
 			outcome.Action = "commented"
 			outcome.Reason = mergeReason
+			if mergeReason == "review_changes_requested" {
+				comments, err := ghPRReviewComments(view.URL)
+				if err == nil {
+					outcome.ReviewComments = comments
+					if *discordAlertsTo != "" && comments != "" {
+						token := strings.TrimSpace(os.Getenv("DISCORD_BOT_TOKEN"))
+						if token != "" {
+							alertsTo := normalizeDiscordTarget(*discordAlertsTo)
+							msg := fmt.Sprintf("🔧 PR %s has changes requested. Review comments:\n%s\nAction needed: address review feedback.", view.URL, comments)
+							_ = discordSendMessage(token, alertsTo, msg)
+						}
+					}
+				}
+				outcome.Action = "review_dispatched"
+			}
 		}
 		out.Results = append(out.Results, outcome)
 		if commentErr == nil {
@@ -521,7 +537,7 @@ func summarize(results []prOutcome) (merged int, commented int, skipped int, err
 		switch r.Action {
 		case "merged":
 			merged++
-		case "commented":
+		case "commented", "review_dispatched":
 			commented++
 		case "skipped":
 			skipped++
@@ -798,6 +814,35 @@ func ghPRComment(url string, body string) error {
 	}
 	_, err := runCmd("gh", args...)
 	return err
+}
+
+func ghPRReviewComments(url string) (string, error) {
+	if strings.TrimSpace(url) == "" {
+		return "", errors.New("pr url required")
+	}
+	args := []string{
+		"pr", "view", url,
+		"--json", "reviews",
+		"--jq", `.reviews[] | select(.state == "CHANGES_REQUESTED") | .body`,
+	}
+	stdout, err := runCmd("gh", args...)
+	if err != nil {
+		return "", err
+	}
+	bodies := strings.Split(string(stdout), "\n")
+	for i := range bodies {
+		bodies[i] = strings.TrimSpace(bodies[i])
+	}
+	filtered := make([]string, 0, len(bodies))
+	for _, b := range bodies {
+		if b != "" {
+			filtered = append(filtered, b)
+		}
+	}
+	if len(filtered) == 0 {
+		return "", nil
+	}
+	return strings.Join(filtered, "\n\n"), nil
 }
 
 type repoInfo struct {
