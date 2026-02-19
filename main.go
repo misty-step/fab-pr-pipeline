@@ -129,6 +129,8 @@ type prView struct {
 
 type statusRollupEntry struct {
 	Typename   string `json:"__typename"`
+	Name       string `json:"name"`
+	Context    string `json:"context"`
 	Status     string `json:"status"`     // CheckRun
 	Conclusion string `json:"conclusion"` // CheckRun
 	State      string `json:"state"`      // StatusContext
@@ -695,6 +697,42 @@ func overallChecksState(entries []statusRollupEntry) string {
 		return "PENDING"
 	}
 	return "SUCCESS"
+}
+
+func classifyCIFailure(entries []statusRollupEntry) string {
+	categories := make(map[string]bool)
+	for _, e := range entries {
+		conclusion := strings.ToUpper(strings.TrimSpace(e.Conclusion))
+		if conclusion == "FAILURE" {
+			nameLower := strings.ToLower(strings.TrimSpace(e.Name))
+			if strings.Contains(nameLower, "lint") ||
+				strings.Contains(nameLower, "golangci") ||
+				strings.Contains(nameLower, "eslint") ||
+				strings.Contains(nameLower, "prettier") {
+				categories["lint"] = true
+			} else if strings.Contains(nameLower, "test") ||
+				strings.Contains(nameLower, "spec") ||
+				strings.Contains(nameLower, "jest") ||
+				strings.Contains(nameLower, "pytest") {
+				categories["test"] = true
+			} else if strings.Contains(nameLower, "build") ||
+				strings.Contains(nameLower, "compile") ||
+				strings.Contains(nameLower, "typecheck") ||
+				strings.Contains(nameLower, "tsc") {
+				categories["build"] = true
+			}
+		}
+	}
+	if len(categories) == 0 {
+		return "unknown"
+	}
+	if len(categories) > 1 {
+		return "mixed"
+	}
+	for cat := range categories {
+		return cat
+	}
+	return "unknown"
 }
 
 func ghSearchPRs(owner string, limit int) ([]searchPR, error) {
