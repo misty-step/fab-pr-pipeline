@@ -424,7 +424,13 @@ func main() {
 			return ghPRComment(view.URL, commentBody)
 		}, retryCfg)
 		if commentErr != nil {
-			if IsPermanent(commentErr) {
+			if IsArchivedError(commentErr) {
+				// Defense-in-depth: batch pre-check missed this (e.g. batch fetch failed).
+				// Downgrade to a skip rather than an error so it doesn't page.
+				outcome.Action = "skipped"
+				outcome.Reason = "repo_archived"
+				fmt.Fprintf(os.Stderr, "[archived-repos] comment fallback detected archived repo %s: %v\n", repoName, commentErr)
+			} else if IsPermanent(commentErr) {
 				outcome.Action = "error"
 				outcome.Reason = "comment failed (permanent): " + commentErr.Error()
 			} else {
