@@ -387,7 +387,19 @@ func main() {
 				continue
 			}
 
-			// Attempt to auto-resolve by merging base into PR branch.
+			// Check for an existing conflict comment BEFORE calling update-branch.
+			// This avoids a redundant update-branch call on every pipeline loop once
+			// we've already flagged the conflict and are awaiting manual resolution.
+			comments, commentsErr := ghPRComments(view.URL)
+			if commentsErr == nil && hasConflictComment(comments) {
+				outcome.Action = "skipped"
+				outcome.Reason = mergeReason + "_already_commented"
+				out.Results = append(out.Results, outcome)
+				cb.RecordSuccess(pr.URL)
+				continue
+			}
+
+			// No existing conflict comment — attempt to auto-resolve by merging base into PR branch.
 			updateErr := ghPRUpdateBranch(view.URL)
 			if updateErr == nil {
 				// Success! Branch updated, conflicts may be resolved.
@@ -398,29 +410,7 @@ func main() {
 				continue
 			}
 
-			// Update failed - check if we already posted a conflict comment.
-			comments, commentsErr := ghPRComments(view.URL)
-			conflictMarker := "merge conflict with the base branch"
-			alreadyCommented := false
-			if commentsErr == nil && len(comments) > 0 {
-				// Check if the most recent comment contains our conflict marker.
-				for _, c := range comments {
-					if strings.Contains(c, conflictMarker) {
-						alreadyCommented = true
-						break
-					}
-				}
-			}
-
-			if alreadyCommented {
-				outcome.Action = "skipped"
-				outcome.Reason = mergeReason + "_already_commented"
-				out.Results = append(out.Results, outcome)
-				cb.RecordSuccess(pr.URL)
-				continue
-			}
-
-			// Post conflict comment.
+			// Update failed — post a conflict comment.
 			commentBody := buildCommentBody(view, mergeReason)
 			commentErr := Retryable(func() error {
 				return ghPRComment(view.URL, commentBody)
@@ -969,7 +959,8 @@ func ghPRUpdateBranch(url string) error {
 	return err
 }
 
-// ghPRComments fetches all comment bodies from a PR, ordered newest first.
+// ghPRComments fetches the most recent 100 comment bodies from a PR, ordered newest first.
+// 100 is sufficient for dedup purposes and avoids unbounded fetching on high-traffic PRs.
 func ghPRComments(url string) ([]string, error) {
 	if strings.TrimSpace(url) == "" {
 		return nil, errors.New("pr url required")
@@ -977,7 +968,7 @@ func ghPRComments(url string) ([]string, error) {
 	args := []string{
 		"pr", "view", url,
 		"--json", "comments",
-		"--jq", ".comments | sort_by(.createdAt) | reverse | .[].body",
+		"--jq", ".comments | sort_by(.createdAt) | reverse | .[0:100] | .[].body",
 	}
 	stdout, err := runCmd("gh", args...)
 	if err != nil {
@@ -1084,6 +1075,23 @@ func isDoNotTouch(labelName string, title string, body string, labels []label) b
 	needle := "do not touch"
 	hay := strings.ToLower(title + "\n" + body)
 	return strings.Contains(hay, needle)
+}
+
+// conflictCommentMarker is the canonical substring we search for to detect a
+// previously-posted conflict comment (present in both the comment body and the
+// dedup check).
+const conflictCommentMarker = "merge conflict with the base branch"
+
+// hasConflictComment reports whether any of the given comment bodies contains
+// our conflict marker. Used for deduplication: if we already posted a conflict
+// comment we skip posting again (and skip the redundant update-branch call).
+func hasConflictComment(comments []string) bool {
+	for _, c := range comments {
+		if strings.Contains(c, conflictCommentMarker) {
+			return true
+		}
+	}
+	return false
 }
 
 func buildCommentBody(pr *prView, reason string) string {
