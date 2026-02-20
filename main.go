@@ -377,6 +377,75 @@ func main() {
 			continue
 		}
 
+		// Handle CONFLICTING mergeable state: try auto-update, then post dedup'd comment.
+		if mergeReason == "mergeable_conflicting" {
+			if *dryRun {
+				outcome.Action = "skipped"
+				outcome.Reason = "dry_run_" + mergeReason
+				out.Results = append(out.Results, outcome)
+				cb.RecordSuccess(pr.URL)
+				continue
+			}
+
+			// Attempt to auto-resolve by merging base into PR branch.
+			updateErr := ghPRUpdateBranch(view.URL)
+			if updateErr == nil {
+				// Success! Branch updated, conflicts may be resolved.
+				outcome.Action = "conflict_resolved"
+				outcome.Reason = mergeReason
+				out.Results = append(out.Results, outcome)
+				cb.RecordSuccess(pr.URL)
+				continue
+			}
+
+			// Update failed - check if we already posted a conflict comment.
+			comments, commentsErr := ghPRComments(view.URL)
+			conflictMarker := "merge conflict with the base branch"
+			alreadyCommented := false
+			if commentsErr == nil && len(comments) > 0 {
+				// Check if the most recent comment contains our conflict marker.
+				for _, c := range comments {
+					if strings.Contains(c, conflictMarker) {
+						alreadyCommented = true
+						break
+					}
+				}
+			}
+
+			if alreadyCommented {
+				outcome.Action = "skipped"
+				outcome.Reason = mergeReason + "_already_commented"
+				out.Results = append(out.Results, outcome)
+				cb.RecordSuccess(pr.URL)
+				continue
+			}
+
+			// Post conflict comment.
+			commentBody := buildCommentBody(view, mergeReason)
+			commentErr := Retryable(func() error {
+				return ghPRComment(view.URL, commentBody)
+			}, retryCfg)
+			if commentErr != nil {
+				if IsArchivedError(commentErr) {
+					outcome.Action = "skipped"
+					outcome.Reason = "repo_archived"
+				} else if IsPermanent(commentErr) {
+					outcome.Action = "error"
+					outcome.Reason = "conflict comment failed (permanent): " + commentErr.Error()
+				} else {
+					outcome.Action = "error"
+					outcome.Reason = "conflict comment failed (after retries): " + commentErr.Error()
+					cb.RecordFailure(pr.URL)
+				}
+			} else {
+				outcome.Action = "commented"
+				outcome.Reason = mergeReason
+				cb.RecordSuccess(pr.URL)
+			}
+			out.Results = append(out.Results, outcome)
+			continue
+		}
+
 		if strings.HasPrefix(mergeReason, "checks_") {
 			outcome.CIFailureType = classifyCIFailure(view.StatusCheckRollup)
 			if outcome.CIFailureType == "lint" && *discordAlertsTo != "" {
@@ -887,6 +956,43 @@ func ghPRComment(url string, body string) error {
 	return err
 }
 
+// ghPRUpdateBranch attempts to update a PR branch from its base branch.
+// This can automatically resolve merge conflicts when the base has moved forward.
+func ghPRUpdateBranch(url string) error {
+	if strings.TrimSpace(url) == "" {
+		return errors.New("pr url required")
+	}
+	args := []string{
+		"pr", "update-branch", url,
+	}
+	_, err := runCmd("gh", args...)
+	return err
+}
+
+// ghPRComments fetches all comment bodies from a PR, ordered newest first.
+func ghPRComments(url string) ([]string, error) {
+	if strings.TrimSpace(url) == "" {
+		return nil, errors.New("pr url required")
+	}
+	args := []string{
+		"pr", "view", url,
+		"--json", "comments",
+		"--jq", ".comments | sort_by(.createdAt) | reverse | .[].body",
+	}
+	stdout, err := runCmd("gh", args...)
+	if err != nil {
+		return nil, err
+	}
+	bodies := strings.Split(string(stdout), "\n")
+	filtered := make([]string, 0, len(bodies))
+	for _, b := range bodies {
+		if trimmed := strings.TrimSpace(b); trimmed != "" {
+			filtered = append(filtered, trimmed)
+		}
+	}
+	return filtered, nil
+}
+
 func ghPRReviewComments(url string) (string, error) {
 	if strings.TrimSpace(url) == "" {
 		return "", errors.New("pr url required")
@@ -981,6 +1087,12 @@ func isDoNotTouch(labelName string, title string, body string, labels []label) b
 }
 
 func buildCommentBody(pr *prView, reason string) string {
+	// Distinct message for merge conflicts - auto-update failed, needs manual resolution.
+	if reason == "mergeable_conflicting" {
+		return "<!-- kaylee-pr-pipeline -->\n" +
+			"⚠️ This PR has merge conflict with the base branch. Automatic merge-in failed — please resolve conflicts manually and push."
+	}
+
 	// Keep it short and deterministic; this is meant to be machine-run.
 	lines := []string{
 		"<!-- kaylee-pr-pipeline -->",
