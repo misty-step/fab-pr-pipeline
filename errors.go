@@ -45,6 +45,9 @@ func classifyError(err error) ErrorKind {
 		"404",
 		" archived ",
 		"is archived",
+		"read-only",
+		"issue is locked",
+		"issues are disabled",
 		"permission denied",
 		"403",
 		"unauthorized",
@@ -105,6 +108,29 @@ func IsTransient(err error) bool {
 // IsPermanent returns true if the error is classified as permanent.
 func IsPermanent(err error) bool {
 	return classifyError(err) == Permanent
+}
+
+// IsArchivedError returns true if the error indicates a repo is archived or
+// read-only (e.g. "is archived", "read-only", "issue is locked").
+// Used to downgrade comment failures on archived repos from errors to skips.
+func IsArchivedError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	archivedIndicators := []string{
+		" archived ",
+		"is archived",
+		"read-only",
+		"issue is locked",
+		"issues are disabled",
+	}
+	for _, indicator := range archivedIndicators {
+		if strings.Contains(msg, indicator) {
+			return true
+		}
+	}
+	return false
 }
 
 // WrapError adds classification metadata to an error.
