@@ -380,7 +380,7 @@ func main() {
 		if strings.HasPrefix(mergeReason, "checks_") {
 			outcome.CIFailureType = classifyCIFailure(view.StatusCheckRollup)
 			if outcome.CIFailureType == "lint" && *discordAlertsTo != "" {
-				token := strings.TrimSpace(os.Getenv("DISCORD_BOT_TOKEN"))
+				token := strings.TrimSpace(discordBotToken())
 				if token != "" {
 					alertsTo := normalizeDiscordTarget(*discordAlertsTo)
 					msg := fmt.Sprintf("🧹 Lint failure on PR %s (%s#%d). Dispatch lint-fix agent.", view.URL, pr.Repository.NameWithOwner, pr.Number)
@@ -450,7 +450,7 @@ func main() {
 				if err == nil {
 					outcome.ReviewComments = comments
 					if *discordAlertsTo != "" && comments != "" {
-						token := strings.TrimSpace(os.Getenv("DISCORD_BOT_TOKEN"))
+						token := strings.TrimSpace(discordBotToken())
 						if token != "" {
 							alertsTo := normalizeDiscordTarget(*discordAlertsTo)
 							msg := fmt.Sprintf("🔧 PR %s has changes requested. Review comments:\n%s\nAction needed: address review feedback.", view.URL, comments)
@@ -505,7 +505,7 @@ func maybePostDiscord(out runOutput, reportToRaw string, alertsToRaw string, pos
 		return nil
 	}
 
-	token := strings.TrimSpace(os.Getenv("DISCORD_BOT_TOKEN"))
+	token := strings.TrimSpace(discordBotToken())
 	if token == "" {
 		return errors.New("DISCORD_BOT_TOKEN missing (needed for Discord posting)")
 	}
@@ -541,7 +541,7 @@ func postDiscordAlertIfConfigured(alertsToRaw string, msg string) {
 	if alertsTo == "" {
 		return
 	}
-	token := strings.TrimSpace(os.Getenv("DISCORD_BOT_TOKEN"))
+	token := strings.TrimSpace(discordBotToken())
 	if token == "" {
 		return
 	}
@@ -628,6 +628,15 @@ func renderDiscordAlert(out runOutput, errs int) string {
 		return msg
 	}
 	return msg[:1890] + "\n(truncated)"
+}
+
+// discordBotToken returns the bot token to use for Discord posting.
+// Prefers DISCORD_BOT_TOKEN_AMOS (Amos's bot) over the generic DISCORD_BOT_TOKEN.
+func discordBotToken() string {
+	if t := strings.TrimSpace(os.Getenv("DISCORD_BOT_TOKEN_AMOS")); t != "" {
+		return t
+	}
+	return strings.TrimSpace(os.Getenv("DISCORD_BOT_TOKEN"))
 }
 
 func discordSendMessage(token string, channelID string, content string) error {
