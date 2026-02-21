@@ -439,7 +439,7 @@ func main() {
 		if strings.HasPrefix(mergeReason, "checks_") {
 			outcome.CIFailureType = classifyCIFailure(view.StatusCheckRollup)
 			if outcome.CIFailureType == "lint" && *discordAlertsTo != "" {
-				token := strings.TrimSpace(os.Getenv("DISCORD_BOT_TOKEN"))
+				token := strings.TrimSpace(discordBotToken())
 				if token != "" {
 					alertsTo := normalizeDiscordTarget(*discordAlertsTo)
 					msg := fmt.Sprintf("🧹 Lint failure on PR %s (%s#%d). Dispatch lint-fix agent.", view.URL, pr.Repository.NameWithOwner, pr.Number)
@@ -509,7 +509,7 @@ func main() {
 				if err == nil {
 					outcome.ReviewComments = comments
 					if *discordAlertsTo != "" && comments != "" {
-						token := strings.TrimSpace(os.Getenv("DISCORD_BOT_TOKEN"))
+						token := strings.TrimSpace(discordBotToken())
 						if token != "" {
 							alertsTo := normalizeDiscordTarget(*discordAlertsTo)
 							msg := fmt.Sprintf("🔧 PR %s has changes requested. Review comments:\n%s\nAction needed: address review feedback.", view.URL, comments)
@@ -564,7 +564,7 @@ func maybePostDiscord(out runOutput, reportToRaw string, alertsToRaw string, pos
 		return nil
 	}
 
-	token := strings.TrimSpace(os.Getenv("DISCORD_BOT_TOKEN"))
+	token := strings.TrimSpace(discordBotToken())
 	if token == "" {
 		return errors.New("DISCORD_BOT_TOKEN missing (needed for Discord posting)")
 	}
@@ -579,7 +579,7 @@ func maybePostDiscord(out runOutput, reportToRaw string, alertsToRaw string, pos
 	if postErr != nil {
 		// Best-effort alert.
 		if alertsTo != "" && alertsTo != reportTo {
-			_ = discordSendMessage(token, alertsTo, "Kaylee PR pipeline: failed to post report: "+postErr.Error())
+			_ = discordSendMessage(token, alertsTo, "PR pipeline: failed to post report: "+postErr.Error())
 		}
 		return postErr
 	}
@@ -600,11 +600,11 @@ func postDiscordAlertIfConfigured(alertsToRaw string, msg string) {
 	if alertsTo == "" {
 		return
 	}
-	token := strings.TrimSpace(os.Getenv("DISCORD_BOT_TOKEN"))
+	token := strings.TrimSpace(discordBotToken())
 	if token == "" {
 		return
 	}
-	_ = discordSendMessage(token, alertsTo, "Kaylee PR pipeline error: "+msg)
+	_ = discordSendMessage(token, alertsTo, "PR pipeline error: "+msg)
 }
 
 func normalizeDiscordTarget(raw string) string {
@@ -636,7 +636,7 @@ func summarize(results []prOutcome) (merged int, commented int, skipped int, err
 
 func renderDiscordSummary(out runOutput, merged int, commented int, skipped int, errs int) string {
 	lines := []string{
-		"Kaylee PR pipeline run",
+		"PR pipeline run",
 		fmt.Sprintf("- startedAt: `%s`", out.StartedAt),
 		fmt.Sprintf("- org: `%s` | maxPRs: `%d` | staleHours(phaedrus-only): `%d` | dryRun: `%t`", out.Org, out.MaxPRs, out.StaleHours, out.DryRun),
 		fmt.Sprintf("- results: merged=`%d` commented=`%d` skipped=`%d` errors=`%d`", merged, commented, skipped, errs),
@@ -666,7 +666,7 @@ func renderDiscordSummary(out runOutput, merged int, commented int, skipped int,
 
 func renderDiscordAlert(out runOutput, errs int) string {
 	lines := []string{
-		"Kaylee PR pipeline: errors detected",
+		"PR pipeline: errors detected",
 		fmt.Sprintf("- startedAt: `%s`", out.StartedAt),
 		fmt.Sprintf("- errors: `%d`", errs),
 		"",
@@ -687,6 +687,15 @@ func renderDiscordAlert(out runOutput, errs int) string {
 		return msg
 	}
 	return msg[:1890] + "\n(truncated)"
+}
+
+// discordBotToken returns the bot token to use for Discord posting.
+// Prefers DISCORD_BOT_TOKEN_AMOS (Amos's bot) over the generic DISCORD_BOT_TOKEN.
+func discordBotToken() string {
+	if t := strings.TrimSpace(os.Getenv("DISCORD_BOT_TOKEN_AMOS")); t != "" {
+		return t
+	}
+	return strings.TrimSpace(os.Getenv("DISCORD_BOT_TOKEN"))
 }
 
 func discordSendMessage(token string, channelID string, content string) error {
@@ -712,7 +721,7 @@ func discordSendMessage(token string, channelID string, content string) error {
 	}
 	req.Header.Set("Authorization", "Bot "+tok)
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", "misty-step/factory/kaylee-pr-pipeline")
+	req.Header.Set("User-Agent", "misty-step/factory/pr-pipeline")
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -1103,8 +1112,8 @@ func buildCommentBody(pr *prView, reason string) string {
 
 	// Keep it short and deterministic; this is meant to be machine-run.
 	lines := []string{
-		"<!-- kaylee-pr-pipeline -->",
-		"Kaylee PR pipeline: not merged automatically.",
+		"<!-- pr-pipeline -->",
+		"PR pipeline: not merged automatically.",
 		"",
 		fmt.Sprintf("- mergeable: `%s`", pr.Mergeable),
 		fmt.Sprintf("- checks: `%s`", overallChecksState(pr.StatusCheckRollup)),
