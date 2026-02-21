@@ -520,7 +520,7 @@ func maybePostDiscord(out runOutput, reportToRaw string, alertsToRaw string, pos
 	if postErr != nil {
 		// Best-effort alert.
 		if alertsTo != "" && alertsTo != reportTo {
-			_ = discordSendMessage(token, alertsTo, "Kaylee PR pipeline: failed to post report: "+postErr.Error())
+			_ = discordSendMessage(token, alertsTo, "PR pipeline: failed to post report: "+postErr.Error())
 		}
 		return postErr
 	}
@@ -545,7 +545,7 @@ func postDiscordAlertIfConfigured(alertsToRaw string, msg string) {
 	if token == "" {
 		return
 	}
-	_ = discordSendMessage(token, alertsTo, "Kaylee PR pipeline error: "+msg)
+	_ = discordSendMessage(token, alertsTo, "PR pipeline error: "+msg)
 }
 
 func normalizeDiscordTarget(raw string) string {
@@ -577,7 +577,7 @@ func summarize(results []prOutcome) (merged int, commented int, skipped int, err
 
 func renderDiscordSummary(out runOutput, merged int, commented int, skipped int, errs int) string {
 	lines := []string{
-		"Kaylee PR pipeline run",
+		"PR pipeline run",
 		fmt.Sprintf("- startedAt: `%s`", out.StartedAt),
 		fmt.Sprintf("- org: `%s` | maxPRs: `%d` | staleHours(phaedrus-only): `%d` | dryRun: `%t`", out.Org, out.MaxPRs, out.StaleHours, out.DryRun),
 		fmt.Sprintf("- results: merged=`%d` commented=`%d` skipped=`%d` errors=`%d`", merged, commented, skipped, errs),
@@ -607,7 +607,7 @@ func renderDiscordSummary(out runOutput, merged int, commented int, skipped int,
 
 func renderDiscordAlert(out runOutput, errs int) string {
 	lines := []string{
-		"Kaylee PR pipeline: errors detected",
+		"PR pipeline: errors detected",
 		fmt.Sprintf("- startedAt: `%s`", out.StartedAt),
 		fmt.Sprintf("- errors: `%d`", errs),
 		"",
@@ -653,7 +653,7 @@ func discordSendMessage(token string, channelID string, content string) error {
 	}
 	req.Header.Set("Authorization", "Bot "+tok)
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", "misty-step/factory/kaylee-pr-pipeline")
+	req.Header.Set("User-Agent", "misty-step/factory/pr-pipeline")
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -983,8 +983,8 @@ func isDoNotTouch(labelName string, title string, body string, labels []label) b
 func buildCommentBody(pr *prView, reason string) string {
 	// Keep it short and deterministic; this is meant to be machine-run.
 	lines := []string{
-		"<!-- kaylee-pr-pipeline -->",
-		"Kaylee PR pipeline: not merged automatically.",
+		"<!-- pr-pipeline -->",
+		"PR pipeline: not merged automatically.",
 		"",
 		fmt.Sprintf("- mergeable: `%s`", pr.Mergeable),
 		fmt.Sprintf("- checks: `%s`", overallChecksState(pr.StatusCheckRollup)),
