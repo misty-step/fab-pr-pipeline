@@ -2,6 +2,8 @@ package main
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -10,7 +12,9 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -170,6 +174,16 @@ type prOutcome struct {
 	CIFailureType  string `json:"ciFailureType,omitempty"`
 }
 
+// runState tracks the hash of the last run's results and when we last posted to Discord.
+// Used for deduplication: skip posting if nothing changed and we posted recently.
+type runState struct {
+	Hash        string `json:"hash"`
+	LastPostedAt string `json:"last_posted_at"`
+}
+
+// dedupWindow is the minimum time between identical Discord posts.
+const dedupWindow = 2 * time.Hour
+
 type mergeMutationResponse struct {
 	Data struct {
 		MergePullRequest struct {
@@ -209,6 +223,7 @@ func main() {
 		postDryRun         = flag.Bool("post-dry-run", false, "allow posting a report when --dry-run is set")
 		cbFailureThreshold = flag.Int("cb-failures", 3, "circuit breaker: consecutive failures before skipping a PR")
 		cbSkipRuns         = flag.Int("cb-skip-runs", 5, "circuit breaker: number of runs to skip after opening")
+		stateFile          = flag.String("state-file", "", "path to state file for deduplication (default: ~/.config/fab-pr-pipeline/state.json)")
 	)
 	flag.Parse()
 
@@ -527,11 +542,25 @@ func main() {
 	}
 
 	// Post run summary + alerts if configured.
-	if err := maybePostDiscord(out, *discordReportTo, *discordAlertsTo, *postEmpty, *postDryRun); err != nil {
-		out.Ok = false
-		out.Error = err.Error()
-		emitJSON(out)
-		os.Exit(1)
+	// First, check if we should skip due to deduplication.
+	statePath := resolveStatePath(*stateFile)
+	currentHash := hashResults(out.Results)
+	shouldPost, skipReason := shouldPostToDiscord(statePath, currentHash)
+
+	if !shouldPost {
+		fmt.Fprintf(os.Stderr, "[dedup] skipping Discord post: %s\n", skipReason)
+	} else {
+		if err := maybePostDiscord(out, *discordReportTo, *discordAlertsTo, *postEmpty, *postDryRun); err != nil {
+			out.Ok = false
+			out.Error = err.Error()
+			emitJSON(out)
+			os.Exit(1)
+		}
+		// Update state file after successful post
+		if err := saveState(statePath, currentHash); err != nil {
+			fmt.Fprintf(os.Stderr, "[dedup] failed to save state: %v\n", err)
+			// Don't fail the run, just log
+		}
 	}
 
 	emitJSON(out)
@@ -1151,4 +1180,110 @@ func sortByUpdatedAtDesc(prs []searchPR) {
 			j--
 		}
 	}
+}
+
+// resolveStatePath returns the state file path, using the default if not specified.
+func resolveStatePath(customPath string) string {
+	if customPath != "" {
+		return customPath
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		// Fall back to current directory if home dir is unavailable
+		return ".fab-pr-pipeline-state.json"
+	}
+	return filepath.Join(home, ".config", "fab-pr-pipeline", "state.json")
+}
+
+// hashResults computes a deterministic SHA-256 hash of the outcome list.
+// For each result, we use PR URL + Action + Reason, sort them, and hash the joined list.
+func hashResults(results []prOutcome) string {
+	if len(results) == 0 {
+		return ""
+	}
+	// Build list of concatenated strings
+	parts := make([]string, len(results))
+	for i, r := range results {
+		parts[i] = r.URL + "|" + r.Action + "|" + r.Reason
+	}
+	// Sort for deterministic ordering
+	sort.Strings(parts)
+	// Join and hash
+	joined := strings.Join(parts, "\n")
+	hash := sha256.Sum256([]byte(joined))
+	return hex.EncodeToString(hash[:])
+}
+
+// loadState reads the state from the given file path.
+// Returns an empty state if the file doesn't exist or is corrupt.
+// Never returns an error - we treat bad state as "no prior state".
+func loadState(path string) runState {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return runState{}
+	}
+	var state runState
+	if err := json.Unmarshal(data, &state); err != nil {
+		return runState{}
+	}
+	return state
+}
+
+// saveState writes the state to the given file path.
+// Creates the parent directory if needed.
+func saveState(path, hash string) error {
+	state := runState{
+		Hash:         hash,
+		LastPostedAt: time.Now().UTC().Format(time.RFC3339),
+	}
+	data, err := json.MarshalIndent(state, "", "  ")
+	if err != nil {
+		return err
+	}
+	// Ensure parent directory exists
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return err
+	}
+	return os.WriteFile(path, data, 0644)
+}
+
+// shouldPostToDiscord determines whether we should post to Discord based on state.
+// Returns (true, "") if we should post, or (false, reason) if we should skip.
+func shouldPostToDiscord(statePath, currentHash string) (bool, string) {
+	// Always post if no results (empty hash)
+	if currentHash == "" {
+		return true, ""
+	}
+
+	state := loadState(statePath)
+
+	// No prior state - always post
+	if state.Hash == "" {
+		return true, ""
+	}
+
+	// Hash changed - always post
+	if state.Hash != currentHash {
+		return true, ""
+	}
+
+	// Same hash - check if enough time has passed
+	if state.LastPostedAt == "" {
+		return true, ""
+	}
+
+	lastPosted, err := time.Parse(time.RFC3339, state.LastPostedAt)
+	if err != nil {
+		// Bad timestamp - post anyway
+		return true, ""
+	}
+
+	elapsed := time.Since(lastPosted)
+	if elapsed >= dedupWindow {
+		return true, ""
+	}
+
+	// Same hash and within dedup window - skip
+	return false, fmt.Sprintf("same hash, last posted %v ago (< %v)", elapsed.Round(time.Minute), dedupWindow)
 }
