@@ -451,6 +451,16 @@ func main() {
 			continue
 		}
 
+		
+		// Skip transient states
+		if mergeReason == "mergeable_unknown" || mergeReason == "checks_pending" || mergeReason == "checks_in_progress" {
+			outcome.Action = "skipped"
+			outcome.Reason = mergeReason
+			out.Results = append(out.Results, outcome)
+			cb.RecordSuccess(pr.URL)
+			continue
+		}
+
 		if strings.HasPrefix(mergeReason, "checks_") {
 			outcome.CIFailureType = classifyCIFailure(view.StatusCheckRollup)
 			if outcome.CIFailureType == "lint" && *discordAlertsTo != "" {
@@ -461,6 +471,17 @@ func main() {
 					if err := discordSendMessage(token, alertsTo, msg); err != nil {
 						fmt.Fprintf(os.Stderr, "lint alert send failed: %v\n", err)
 					}
+				}
+			} else if mergeReason == "checks_failure" {
+				err := spawnCIFixAgent(pr.Repository.NameWithOwner, pr.Number, pr.URL)
+				if err == nil {
+					outcome.Action = "fix_dispatched"
+					outcome.Reason = mergeReason
+					out.Results = append(out.Results, outcome)
+					cb.RecordSuccess(pr.URL)
+					continue
+				} else {
+					fmt.Fprintf(os.Stderr, "failed to spawn fix agent for %s: %v\n", pr.URL, err)
 				}
 			}
 		}
@@ -652,7 +673,7 @@ func summarize(results []prOutcome) (merged int, commented int, skipped int, err
 		switch r.Action {
 		case "merged":
 			merged++
-		case "commented", "review_dispatched", "lint_dispatched":
+		case "commented", "review_dispatched", "lint_dispatched", "fix_dispatched":
 			commented++
 		case "skipped":
 			skipped++
@@ -1286,4 +1307,31 @@ func shouldPostToDiscord(statePath, currentHash string) (bool, string) {
 
 	// Same hash and within dedup window - skip
 	return false, fmt.Sprintf("same hash, last posted %v ago (< %v)", elapsed.Round(time.Minute), dedupWindow)
+}
+
+func spawnCIFixAgent(repoName string, prNumber int, prURL string) error {
+	branchCmd := exec.Command("gh", "pr", "view", prURL, "--json", "headRefName", "-q", ".headRefName")
+	bout, err := branchCmd.Output()
+	if err != nil {
+		return err
+	}
+	branch := strings.TrimSpace(string(bout))
+
+	runCmd := exec.Command("gh", "run", "list", "--repo", repoName, "--branch", branch, "--status", "failure", "--limit", "1", "--json", "databaseId", "-q", ".[0].databaseId")
+	rout, err := runCmd.Output()
+	if err != nil {
+		return err
+	}
+	runID := strings.TrimSpace(string(rout))
+	var ID string
+	if runID != "" && runID != "null" {
+		ID = runID
+	}
+	if ID == "" {
+		return fmt.Errorf("no failed run found")
+	}
+
+	msg := fmt.Sprintf("CI fix needed: Repo=%s PR=#%d branch=%s url=%s\nRun ID=%s. Diagnose and fix: `gh run view %s --repo %s --log-failed`. Get CI green. No force-push.", repoName, prNumber, branch, prURL, ID, ID, repoName)
+	spawnCmd := exec.Command("/opt/homebrew/bin/openclaw", "agent", "--agent", "eng", "--channel", "discord", "--deliver", "--message", msg)
+	return spawnCmd.Start()
 }
