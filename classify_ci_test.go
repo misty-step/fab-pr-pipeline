@@ -74,6 +74,35 @@ func TestClassifyCIFailure(t *testing.T) {
 			},
 			want: "build",
 		},
+		{
+			name: "compile keyword maps to build",
+			entries: []statusRollupEntry{
+				{Typename: "CheckRun", Name: "compile binary", Conclusion: "FAILURE"},
+			},
+			want: "build",
+		},
+		{
+			name: "skipped conclusion not counted as failure",
+			entries: []statusRollupEntry{
+				{Typename: "CheckRun", Name: "golangci-lint", Conclusion: "SKIPPED"},
+				{Typename: "CheckRun", Name: "build", Conclusion: "NEUTRAL"},
+			},
+			want: "unknown",
+		},
+		{
+			name: "jest maps to test",
+			entries: []statusRollupEntry{
+				{Typename: "CheckRun", Name: "jest unit", Conclusion: "FAILURE"},
+			},
+			want: "test",
+		},
+		{
+			name: "spec maps to test",
+			entries: []statusRollupEntry{
+				{Typename: "CheckRun", Name: "rspec integration", Conclusion: "failure"},
+			},
+			want: "test",
+		},
 	}
 
 	for _, tt := range tests {
