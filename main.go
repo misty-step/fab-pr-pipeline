@@ -402,7 +402,7 @@ func main() {
 			continue
 		}
 
-		// Handle CONFLICTING mergeable state: try auto-update, then post dedup'd comment.
+		// Handle CONFLICTING mergeable state: try auto-update, then dispatch conflict-fix subagent.
 		if mergeReason == "mergeable_conflicting" {
 			if *dryRun {
 				outcome.Action = "skipped"
@@ -412,19 +412,7 @@ func main() {
 				continue
 			}
 
-			// Check for an existing conflict comment BEFORE calling update-branch.
-			// This avoids a redundant update-branch call on every pipeline loop once
-			// we've already flagged the conflict and are awaiting manual resolution.
-			comments, commentsErr := ghPRComments(view.URL)
-			if commentsErr == nil && hasConflictComment(comments) {
-				outcome.Action = "skipped"
-				outcome.Reason = mergeReason + "_already_commented"
-				out.Results = append(out.Results, outcome)
-				cb.RecordSuccess(pr.URL)
-				continue
-			}
-
-			// No existing conflict comment — attempt to auto-resolve by merging base into PR branch.
+			// Attempt to auto-resolve by merging base into PR branch.
 			updateErr := ghPRUpdateBranch(view.URL)
 			if updateErr == nil {
 				// Success! Branch updated, conflicts may be resolved.
@@ -435,25 +423,17 @@ func main() {
 				continue
 			}
 
-			// Update failed — post a conflict comment.
-			commentBody := buildCommentBody(view, mergeReason)
-			commentErr := Retryable(func() error {
-				return ghPRComment(view.URL, commentBody)
-			}, retryCfg)
-			if commentErr != nil {
-				if IsArchivedError(commentErr) {
-					outcome.Action = "skipped"
-					outcome.Reason = "repo_archived"
-				} else if IsPermanent(commentErr) {
-					outcome.Action = "error"
-					outcome.Reason = "conflict comment failed (permanent): " + commentErr.Error()
-				} else {
-					outcome.Action = "error"
-					outcome.Reason = "conflict comment failed (after retries): " + commentErr.Error()
-					cb.RecordFailure(pr.URL)
-				}
+			// Auto-update failed — dispatch conflict-fix subagent (Contract B).
+			// v2: dispatch instead of posting a conflict comment and abandoning.
+			// Hard rule: one dispatch per PR per run — set conflict_dispatched and stop.
+			dispErr := spawnConflictFixSubagent(pr, view, *skillDir)
+			if dispErr != nil {
+				fmt.Fprintf(os.Stderr, "[conflict-fix] dispatch failed for %s: %v\n", view.URL, dispErr)
+				cb.RecordFailure(pr.URL)
+				outcome.Action = "error"
+				outcome.Reason = "conflict_fix_dispatch_failed: " + dispErr.Error()
 			} else {
-				outcome.Action = "commented"
+				outcome.Action = "conflict_dispatched"
 				outcome.Reason = mergeReason
 				cb.RecordSuccess(pr.URL)
 			}
@@ -1141,9 +1121,11 @@ func isDoNotTouch(labelName string, title string, body string, labels []label) b
 // dedup check).
 const conflictCommentMarker = "merge conflict with the base branch"
 
+// Deprecated: use conflict_dispatched action tracking instead.
 // hasConflictComment reports whether any of the given comment bodies contains
-// our conflict marker. Used for deduplication: if we already posted a conflict
-// comment we skip posting again (and skip the redundant update-branch call).
+// our conflict marker. Kept as dead code (safety net) — do not call from the
+// main dispatch loop. The v2 pipeline tracks conflict dispatch via the
+// conflict_dispatched action, not by inspecting past comments.
 func hasConflictComment(comments []string) bool {
 	for _, c := range comments {
 		if strings.Contains(c, conflictCommentMarker) {
