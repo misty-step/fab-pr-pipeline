@@ -8,6 +8,10 @@ import (
 	"strings"
 )
 
+// openclawBin is the path to the openclaw binary used for subagent dispatch.
+// It is a package-level variable so tests can override it with a mock binary.
+var openclawBin = "/opt/homebrew/bin/openclaw"
+
 // skillNames lists the CI-fix skill files to load, in order.
 // These are relative to the skill dir root (e.g. /tmp/codex-config/skills).
 var ciFixSkillNames = []string{
@@ -144,9 +148,146 @@ Hard rules:
 		prURL,
 	)
 
-	_, err = runCmd("/opt/homebrew/bin/openclaw", "agent", "--agent", "eng", "--message", msg)
+	_, err = runCmd(openclawBin, "agent", "--agent", "eng", "--message", msg)
 	if err != nil {
 		return fmt.Errorf("spawnCIFixSubagent: openclaw agent dispatch: %w", err)
+	}
+	return nil
+}
+
+// conflictFixEnvelope is the Contract B JSON envelope dispatched to the conflict-fix subagent.
+type conflictFixEnvelope struct {
+	Task           string                `json:"task"`
+	Repo           string                `json:"repo"`
+	PRNumber       int                   `json:"pr_number"`
+	PRURL          string                `json:"pr_url"`
+	Branch         string                `json:"branch"`
+	BaseBranch     string                `json:"base_branch"`
+	Context        conflictFixContext     `json:"context"`
+	SkillFiles     []string              `json:"skill_files"`
+	OutputContract outputContract        `json:"output_contract"`
+}
+
+type conflictFixContext struct {
+	ConflictingFiles []string `json:"conflicting_files"`
+}
+
+// conflictFixSkillNames lists skill files relevant to conflict resolution.
+// These are relative to the skill dir root (e.g. /tmp/codex-config/skills).
+var conflictFixSkillNames = []string{
+	"git-mastery/SKILL.md",
+	"address-review/SKILL.md",
+}
+
+// buildConflictFixEnvelope constructs the Contract B envelope for the conflict-fix subagent.
+func buildConflictFixEnvelope(repo string, prNumber int, prURL, branch, baseBranch, skillDir string) conflictFixEnvelope {
+	// Build skill file paths — missing files are tolerated at runtime by buildSkillContext.
+	skillPaths := make([]string, len(conflictFixSkillNames))
+	for i, rel := range conflictFixSkillNames {
+		skillPaths[i] = filepath.Join(skillDir, rel)
+	}
+	return conflictFixEnvelope{
+		Task:       "conflict-fix",
+		Repo:       repo,
+		PRNumber:   prNumber,
+		PRURL:      prURL,
+		Branch:     branch,
+		BaseBranch: baseBranch,
+		Context: conflictFixContext{
+			ConflictingFiles: []string{},
+		},
+		SkillFiles: skillPaths,
+		OutputContract: outputContract{
+			Format: "json",
+			Fields: []string{"ok", "action_taken", "commits", "notes"},
+		},
+	}
+}
+
+// buildConflictSkillContext reads conflict-relevant skill files from skillDir.
+// It is a narrower variant of buildSkillContext: it only reads git-mastery and
+// address-review skills. Missing files are logged as warnings and skipped.
+func buildConflictSkillContext(skillDir string) string {
+	var sb strings.Builder
+	for _, rel := range conflictFixSkillNames {
+		p := filepath.Join(skillDir, rel)
+		content, err := os.ReadFile(p)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "[skill-context] warning: could not read %s: %v\n", p, err)
+			continue
+		}
+		skillName := filepath.Base(filepath.Dir(p))
+		sb.WriteString(fmt.Sprintf("--- SKILL: %s ---\n", skillName))
+		sb.Write(content)
+		sb.WriteString("\n\n")
+	}
+	return sb.String()
+}
+
+// spawnConflictFixSubagent dispatches a conflict-fix subagent for the given PR using Contract B.
+// It is called after ghPRUpdateBranch fails (non-trivial merge conflict). This is a
+// fire-and-forget dispatch — the binary does not block waiting for the subagent.
+func spawnConflictFixSubagent(pr searchPR, view *prView, skillDir string) error {
+	owner, repo, prNumber, err := parsePRURL(view.URL)
+	if err != nil {
+		return fmt.Errorf("spawnConflictFixSubagent: %w", err)
+	}
+	repoFull := owner + "/" + repo
+	branch := strings.TrimSpace(view.HeadRefName)
+	baseBranch := strings.TrimSpace(view.BaseRefName)
+	if baseBranch == "" {
+		baseBranch = "main"
+	}
+
+	envelope := buildConflictFixEnvelope(repoFull, prNumber, view.URL, branch, baseBranch, skillDir)
+	envelopeJSON, err := json.Marshal(envelope)
+	if err != nil {
+		return fmt.Errorf("spawnConflictFixSubagent: marshal envelope: %w", err)
+	}
+
+	// Read skill context at dispatch time so subagent doesn't need local filesystem access.
+	skillCtx := buildConflictSkillContext(skillDir)
+	skillSection := ""
+	if skillCtx != "" {
+		skillSection = fmt.Sprintf("\nSkill context (read this first):\n%s\n", skillCtx)
+	}
+
+	msg := fmt.Sprintf(`You are resolving merge conflicts on PR #%d in %s.
+
+Branch: %s, base: %s
+PR URL: %s
+%s
+Contract (for structured output):
+%s
+
+Your job:
+1. git fetch origin
+2. git checkout %s
+3. git rebase origin/%s
+4. For each conflict: resolve SEMANTICALLY based on PR purpose (read the PR description first).
+   Never blindly accept ours/theirs. Understand the intent of both sides.
+5. git rebase --continue (repeat for each conflict file)
+6. Run local verification (project test/build/lint commands)
+7. git push --force-with-lease origin %s
+8. Output JSON: {"ok": true/false, "action_taken": "...", "commits": ["sha..."], "notes": "..."}
+
+Hard rules:
+- Read the PR description before resolving — semantic context drives decisions
+- Never force-push to main/master
+- If conflict is too complex to resolve safely: output ok=false with explanation`,
+		prNumber, repoFull,
+		branch, baseBranch,
+		view.URL,
+		skillSection,
+		string(envelopeJSON),
+		branch,
+		baseBranch,
+		branch,
+	)
+
+	_, err = runCmd(openclawBin, "agent", "--agent", "eng", "--message", msg)
+	if err != nil {
+		return fmt.Errorf("spawnConflictFixSubagent: openclaw agent dispatch: %w", err)
 	}
 	return nil
 }
