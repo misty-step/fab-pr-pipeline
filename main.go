@@ -125,6 +125,8 @@ type prView struct {
 	Mergeable         string              `json:"mergeable"`
 	ReviewDecision    string              `json:"reviewDecision"`
 	MergeStateStatus  string              `json:"mergeStateStatus"`
+	HeadRefName       string              `json:"headRefName"`
+	BaseRefName       string              `json:"baseRefName"`
 	StatusCheckRollup []statusRollupEntry `json:"statusCheckRollup"`
 	Author            struct {
 		Login string `json:"login"`
@@ -185,23 +187,6 @@ type runState struct {
 // dedupWindow is the minimum time between identical Discord posts.
 const dedupWindow = 2 * time.Hour
 
-type mergeMutationResponse struct {
-	Data struct {
-		MergePullRequest struct {
-			PullRequest struct {
-				Merged      bool   `json:"merged"`
-				MergedAt    string `json:"mergedAt"`
-				MergeCommit struct {
-					OID string `json:"oid"`
-				} `json:"mergeCommit"`
-			} `json:"pullRequest"`
-		} `json:"mergePullRequest"`
-	} `json:"data"`
-	Errors []struct {
-		Message string `json:"message"`
-	} `json:"errors"`
-}
-
 // retryConfig for transient error retries.
 var retryCfg = RetryConfig{
 	MaxAttempts: 3,
@@ -225,6 +210,7 @@ func main() {
 		cbFailureThreshold = flag.Int("cb-failures", 3, "circuit breaker: consecutive failures before skipping a PR")
 		cbSkipRuns         = flag.Int("cb-skip-runs", 5, "circuit breaker: number of runs to skip after opening")
 		stateFile          = flag.String("state-file", "", "path to state file for deduplication (default: ~/.config/fab-pr-pipeline/state.json)")
+		skillDir           = flag.String("skill-dir", "/tmp/codex-config/skills", "directory containing skill files for subagent injection (default: /tmp/codex-config/skills)")
 	)
 	flag.Parse()
 
@@ -387,8 +373,16 @@ func main() {
 			}
 
 			oid, mergeErr := RetryableWithResult(func() (string, error) {
-				return ghMergePR(view.ID)
+				return ghMergePR(pr.URL)
 			}, retryCfg)
+			if mergeErr != nil {
+				// Before reporting failure, verify actual PR state — the merge may
+				// have gone through despite a transient API/GraphQL error.
+				if verifiedOID, verifyErr := ghVerifyMerged(pr.URL); verifyErr == nil && verifiedOID != "" {
+					oid = verifiedOID
+					mergeErr = nil
+				}
+			}
 			if mergeErr != nil {
 				if IsPermanent(mergeErr) {
 					outcome.Action = "error"
@@ -469,16 +463,30 @@ func main() {
 
 		if strings.HasPrefix(mergeReason, "checks_") {
 			outcome.CIFailureType = classifyCIFailure(view.StatusCheckRollup)
-			if outcome.CIFailureType == "lint" && *discordAlertsTo != "" {
-				token := strings.TrimSpace(discordBotToken())
-				if token != "" {
-					alertsTo := normalizeDiscordTarget(*discordAlertsTo)
-					msg := fmt.Sprintf("🧹 Lint failure on PR %s (%s#%d). Dispatch lint-fix agent.", view.URL, pr.Repository.NameWithOwner, pr.Number)
-					if err := discordSendMessage(token, alertsTo, msg); err != nil {
-						fmt.Fprintf(os.Stderr, "lint alert send failed: %v\n", err)
-					}
-				}
+			if *dryRun {
+				outcome.Action = "skipped"
+				outcome.Reason = "dry_run_" + mergeReason
+				out.Results = append(out.Results, outcome)
+				cb.RecordSuccess(pr.URL)
+				continue
 			}
+			// Dispatch CI-fix subagent for ALL CI failure types (lint, test, build, mixed, unknown).
+			// v1 only dispatched for checks_failure; lint was alert-only — v2 fixes this.
+			skillCtx := buildSkillContext(*skillDir)
+			branch := strings.TrimSpace(view.HeadRefName)
+			dispErr := spawnCIFixSubagent(view.URL, branch, skillCtx, outcome.CIFailureType, *skillDir)
+			if dispErr != nil {
+				fmt.Fprintf(os.Stderr, "[ci-fix] dispatch failed for %s: %v\n", view.URL, dispErr)
+				cb.RecordFailure(pr.URL)
+				outcome.Action = "error"
+				outcome.Reason = "ci_fix_dispatch_failed: " + dispErr.Error()
+			} else {
+				outcome.Action = "ci_fix_dispatched"
+				outcome.Reason = mergeReason
+				cb.RecordSuccess(pr.URL)
+			}
+			out.Results = append(out.Results, outcome)
+			continue
 		}
 
 		// Skip archived repos - they're read-only and can't accept comments.
@@ -668,7 +676,7 @@ func summarize(results []prOutcome) (merged int, commented int, skipped int, err
 		switch r.Action {
 		case "merged":
 			merged++
-		case "commented", "review_dispatched", "lint_dispatched":
+		case "commented", "review_dispatched", "lint_dispatched", "ci_fix_dispatched":
 			commented++
 		case "skipped":
 			skipped++
@@ -912,7 +920,7 @@ func ghPRView(url string) (*prView, error) {
 	}
 	args := []string{
 		"pr", "view", url,
-		"--json", "id,url,title,body,isDraft,mergeable,reviewDecision,mergeStateStatus,statusCheckRollup,author,labels",
+		"--json", "id,url,title,body,isDraft,mergeable,reviewDecision,mergeStateStatus,headRefName,baseRefName,statusCheckRollup,author,labels",
 	}
 	stdout, err := runCmd("gh", args...)
 	if err != nil {
@@ -949,40 +957,37 @@ func mergeAllowed(pr *prView) (bool, string) {
 	return true, ""
 }
 
-func ghMergePR(pullRequestNodeID string) (string, error) {
-	if strings.TrimSpace(pullRequestNodeID) == "" {
-		return "", errors.New("pull request node id required")
+// ghMergePR merges a PR by URL using `gh pr merge`. Returns the merge commit OID.
+func ghMergePR(prURL string) (string, error) {
+	if strings.TrimSpace(prURL) == "" {
+		return "", errors.New("pr url required")
 	}
-	query := `mutation($pullRequestId: ID!) {
-  mergePullRequest(input: { pullRequestId: $pullRequestId, mergeMethod: MERGE }) {
-    pullRequest {
-      merged
-      mergedAt
-      mergeCommit { oid }
-    }
-  }
-}`
-	args := []string{
-		"api", "graphql",
-		"-f", "query=" + query,
-		"-f", "pullRequestId=" + pullRequestNodeID,
-	}
-	stdout, err := runCmd("gh", args...)
-	if err != nil {
+	if _, err := runCmd("gh", "pr", "merge", prURL, "--merge"); err != nil {
 		return "", err
 	}
-	var resp mergeMutationResponse
-	if err := json.Unmarshal(stdout, &resp); err != nil {
-		return "", fmt.Errorf("parse merge response: %w", err)
+	return ghVerifyMerged(prURL)
+}
+
+// ghVerifyMerged checks whether a PR is actually merged and returns its merge commit OID.
+// Returns ("", nil) if the PR exists but is not yet merged.
+func ghVerifyMerged(prURL string) (string, error) {
+	stdout, err := runCmd("gh", "pr", "view", prURL, "--json", "state,mergeCommit")
+	if err != nil {
+		return "", fmt.Errorf("verify merge state: %w", err)
 	}
-	if len(resp.Errors) > 0 {
-		return "", errors.New(resp.Errors[0].Message)
+	var v struct {
+		State       string `json:"state"`
+		MergeCommit struct {
+			OID string `json:"oid"`
+		} `json:"mergeCommit"`
 	}
-	oid := resp.Data.MergePullRequest.PullRequest.MergeCommit.OID
-	if oid == "" {
-		return "", errors.New("merge mutation returned empty mergeCommit oid")
+	if err := json.Unmarshal(stdout, &v); err != nil {
+		return "", fmt.Errorf("parse merge state: %w", err)
 	}
-	return oid, nil
+	if v.State != "MERGED" {
+		return "", nil
+	}
+	return v.MergeCommit.OID, nil
 }
 
 func ghPRComment(url string, body string) error {
@@ -1170,7 +1175,8 @@ func buildCommentBody(pr *prView, reason string) string {
 	if strings.HasPrefix(reason, "checks_") {
 		ciType := classifyCIFailure(pr.StatusCheckRollup)
 		if ciType == "lint" {
-			lines = append(lines, "🧹 Lint-fix subagent dispatched via Discord for batch dispatch.")
+			// v2: lint failures are dispatched via spawnCIFixSubagent (same path as all CI failures).
+			lines = append(lines, "🧹 CI-fix subagent dispatched (lint failure).")
 		}
 	}
 	return strings.Join(lines, "\n")
