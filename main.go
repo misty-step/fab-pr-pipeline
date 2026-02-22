@@ -1509,7 +1509,13 @@ func spawnCIFixAgent(repoName string, prNumber int, prURL string) error {
 		return fmt.Errorf("no failed run found")
 	}
 
-	msg := fmt.Sprintf("CI fix needed: Repo=%s PR=#%d branch=%s url=%s\nRun ID=%s. Diagnose and fix: `gh run view %s --repo %s --log-failed`. Get CI green. No force-push.", repoName, prNumber, branch, prURL, ID, ID, repoName)
+	msg := fmt.Sprintf(`CI failure blocking merge on %s PR #%d (%s branch: %s run: %s).
+
+Done = all required checks green on that branch, PR mergeable, no force-push, no unrelated changes.
+
+Failure modes to avoid: fixing the symptom not the root cause, breaking other tests to make this one pass, pushing unrelated refactors, assuming the failure is flaky without checking logs.
+
+Dispatch a fix agent. Give it: the repo, branch, run ID, and a clear success definition. Let it read the logs and diagnose — don't prescribe commands. Require a completion contract.`, prURL, prNumber, repoName, branch, ID)
 	spawnCmd := exec.Command("/opt/homebrew/bin/openclaw", "agent", "--agent", "eng", "--channel", "discord", "--deliver", "--message", msg)
 	return spawnCmd.Start()
 }
