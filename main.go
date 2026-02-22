@@ -318,6 +318,10 @@ func main() {
 		fmt.Fprintf(os.Stderr, "[archived-repos] batch-checked %d repos, %d archived\n", len(archivedRepos), archivedCount)
 	}
 
+	// fixDispatched tracks PRs that have already had a CI fix agent dispatched
+	// this run, to prevent redundant dispatches on every pipeline execution.
+	fixDispatched := make(map[string]bool)
+
 	acted := 0
 	for _, pr := range selected {
 		if acted >= *maxPRs {
@@ -489,9 +493,10 @@ func main() {
 					}
 				}
 			}
-			if mergeReason == "checks_failure" {
+			if mergeReason == "checks_failure" && !fixDispatched[pr.URL] {
 				err := spawnCIFixAgent(pr.Repository.NameWithOwner, pr.Number, pr.URL)
 				if err == nil {
+					fixDispatched[pr.URL] = true
 					outcome.Action = "fix_dispatched"
 					outcome.Reason = mergeReason
 					out.Results = append(out.Results, outcome)
@@ -1488,24 +1493,18 @@ func shouldPostToDiscord(statePath, currentHash string) (bool, string) {
 }
 
 func spawnCIFixAgent(repoName string, prNumber int, prURL string) error {
-	branchCmd := exec.Command("gh", "pr", "view", prURL, "--json", "headRefName", "-q", ".headRefName")
-	bout, err := branchCmd.Output()
+	bout, err := runCmd("gh", "pr", "view", prURL, "--json", "headRefName", "-q", ".headRefName")
 	if err != nil {
 		return err
 	}
 	branch := strings.TrimSpace(string(bout))
 
-	runCmd := exec.Command("gh", "run", "list", "--repo", repoName, "--branch", branch, "--status", "failure", "--limit", "1", "--json", "databaseId", "-q", ".[0].databaseId")
-	rout, err := runCmd.Output()
+	rout, err := runCmd("gh", "run", "list", "--repo", repoName, "--branch", branch, "--status", "failure", "--limit", "1", "--json", "databaseId", "-q", ".[0].databaseId")
 	if err != nil {
 		return err
 	}
 	runID := strings.TrimSpace(string(rout))
-	var ID string
-	if runID != "" && runID != "null" {
-		ID = runID
-	}
-	if ID == "" {
+	if runID == "" || runID == "null" {
 		return fmt.Errorf("no failed run found")
 	}
 
@@ -1515,7 +1514,13 @@ Done = all required checks green on that branch, PR mergeable, no force-push, no
 
 Failure modes to avoid: fixing the symptom not the root cause, breaking other tests to make this one pass, pushing unrelated refactors, assuming the failure is flaky without checking logs.
 
-Dispatch a fix agent. Give it: the repo, branch, run ID, and a clear success definition. Let it read the logs and diagnose — don't prescribe commands. Require a completion contract.`, prURL, prNumber, repoName, branch, ID)
-	spawnCmd := exec.Command("/opt/homebrew/bin/openclaw", "agent", "--agent", "eng", "--channel", "discord", "--deliver", "--message", msg)
-	return spawnCmd.Start()
+Dispatch a fix agent. Give it: the repo, branch, run ID, and a clear success definition. Let it read the logs and diagnose — don't prescribe commands. Require a completion contract.`, prURL, prNumber, repoName, branch, runID)
+	spawnCmd := exec.Command("openclaw", "agent", "--agent", "eng", "--channel", "discord", "--deliver", "--message", msg)
+	spawnCmd.Env = os.Environ()
+	if err := spawnCmd.Start(); err != nil {
+		return err
+	}
+	// Reap the child process in the background to avoid zombies.
+	go func() { _ = spawnCmd.Wait() }()
+	return nil
 }
