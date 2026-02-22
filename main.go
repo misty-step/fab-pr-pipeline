@@ -488,7 +488,8 @@ func main() {
 						fmt.Fprintf(os.Stderr, "lint alert send failed: %v\n", err)
 					}
 				}
-			} else if mergeReason == "checks_failure" {
+			}
+			if mergeReason == "checks_failure" {
 				err := spawnCIFixAgent(pr.Repository.NameWithOwner, pr.Number, pr.URL)
 				if err == nil {
 					outcome.Action = "fix_dispatched"
