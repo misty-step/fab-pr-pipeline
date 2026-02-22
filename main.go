@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -269,16 +270,31 @@ func main() {
 		if author == "" {
 			continue
 		}
-		if strings.EqualFold(author, *phaedrus) {
-			age := time.Since(pr.UpdatedAt)
-			if age < time.Duration(*staleHours)*time.Hour {
+
+		// Three-branch author check (R1.1–R1.3):
+		//   kaylee-authored → eligible immediately
+		//   phrazzld-authored → eligible only if phaedrus hasn't touched it in last staleHours
+		//   anyone else → skip
+		if strings.EqualFold(author, *kaylee) {
+			// R1.1: kaylee-authored PR — eligible immediately, no time gate.
+			selected = append(selected, pr)
+		} else if strings.EqualFold(author, *phaedrus) {
+			// R1.2: phrazzld-authored — check actual last touch (commits, reviews, comments).
+			// Uses GraphQL; one extra API call per phrazzld PR (acceptable per spec).
+			lastTouch, ltErr := phrazzldLastTouched(pr.URL, *phaedrus)
+			if ltErr != nil {
+				fmt.Fprintf(os.Stderr, "[selection] phrazzldLastTouched failed for %s: %v (falling back to updatedAt)\n", pr.URL, ltErr)
+				// Fallback: use updatedAt as a proxy (same as v1 behavior) to avoid
+				// silently dropping PRs when the API call fails.
+				lastTouch = pr.UpdatedAt
+			}
+			if !lastTouch.IsZero() && time.Since(lastTouch) < time.Duration(*staleHours)*time.Hour {
+				// phaedrus touched this PR recently — skip it.
 				continue
 			}
+			selected = append(selected, pr)
 		}
-		// Kaylee-authored: act immediately (no stale wait)
-		// Everyone else: act immediately (no stale wait), per spec.
-		_ = kaylee // kept for clarity and future tuning.
-		selected = append(selected, pr)
+		// R1.3: any other author → skip (do not append)
 	}
 
 	// Process most-recently-updated PRs first — they're more likely
@@ -1189,6 +1205,167 @@ func repoFromPRURL(prURL string) string {
 		return m[1] + "/" + m[2]
 	}
 	return ""
+}
+
+// parsePRURL extracts owner, repo, and PR number from a GitHub PR URL.
+// Returns an error if the URL does not match the expected format.
+func parsePRURL(prURL string) (owner, repo string, number int, err error) {
+	re := regexp.MustCompile(`^https://github\.com/([^/]+)/([^/]+)/pull/(\d+)/?$`)
+	m := re.FindStringSubmatch(strings.TrimSpace(prURL))
+	if len(m) != 4 {
+		return "", "", 0, fmt.Errorf("cannot parse PR URL: %q", prURL)
+	}
+	n, convErr := strconv.Atoi(m[3])
+	if convErr != nil {
+		return "", "", 0, fmt.Errorf("invalid PR number in URL %q: %w", prURL, convErr)
+	}
+	return m[1], m[2], n, nil
+}
+
+// phrazzldLastTouched returns the most recent time phaedrusLogin authored a
+// commit, review, or issue comment on the given PR. Returns the zero time if
+// phaedrusLogin has no such activity on this PR.
+//
+// Uses gh api graphql to query timeline items (first 100 per type — pagination
+// not implemented; add cursor-based pagination if PRs with >100 items appear).
+func phrazzldLastTouched(prURL, phaedrusLogin string) (time.Time, error) {
+	owner, repo, number, err := parsePRURL(prURL)
+	if err != nil {
+		return time.Time{}, err
+	}
+
+	// Query comments, reviews, and commits for this PR.
+	// Pagination note: each section is capped at last:100. For PRs with more
+	// than 100 items in any category, add cursor-based pagination here.
+	query := `query($owner:String!, $repo:String!, $number:Int!) {
+  repository(owner:$owner, name:$repo) {
+    pullRequest(number:$number) {
+      comments(last:100) {
+        nodes { author { login } createdAt }
+      }
+      reviews(last:100) {
+        nodes { author { login } submittedAt }
+      }
+      commits(last:100) {
+        nodes {
+          commit { committedDate }
+          author { user { login } }
+        }
+      }
+    }
+  }
+}`
+
+	args := []string{
+		"api", "graphql",
+		"-f", "query=" + query,
+		"-f", "owner=" + owner,
+		"-f", "repo=" + repo,
+		"-F", fmt.Sprintf("number=%d", number),
+	}
+	stdout, err := runCmd("gh", args...)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("phrazzldLastTouched graphql: %w", err)
+	}
+
+	return parseLastTouched(stdout, phaedrusLogin)
+}
+
+// phrazzldTimelineResponse is the GraphQL response shape for phrazzldLastTouched.
+type phrazzldTimelineResponse struct {
+	Data struct {
+		Repository struct {
+			PullRequest struct {
+				Comments struct {
+					Nodes []struct {
+						Author    struct{ Login string } `json:"author"`
+						CreatedAt string                 `json:"createdAt"`
+					} `json:"nodes"`
+				} `json:"comments"`
+				Reviews struct {
+					Nodes []struct {
+						Author      struct{ Login string } `json:"author"`
+						SubmittedAt string                 `json:"submittedAt"`
+					} `json:"nodes"`
+				} `json:"reviews"`
+				Commits struct {
+					Nodes []struct {
+						Commit struct {
+							CommittedDate string `json:"committedDate"`
+						} `json:"commit"`
+						Author struct {
+							User *struct {
+								Login string `json:"login"`
+							} `json:"user"`
+						} `json:"author"`
+					} `json:"nodes"`
+				} `json:"commits"`
+			} `json:"pullRequest"`
+		} `json:"repository"`
+	} `json:"data"`
+}
+
+// parseLastTouched parses the raw GraphQL JSON response and returns the most
+// recent timestamp for events authored by phaedrusLogin.
+// Extracted as a separate function to make it testable with mock output.
+func parseLastTouched(raw []byte, phaedrusLogin string) (time.Time, error) {
+	var resp phrazzldTimelineResponse
+	if err := json.Unmarshal(raw, &resp); err != nil {
+		return time.Time{}, fmt.Errorf("parseLastTouched: %w", err)
+	}
+
+	login := strings.ToLower(strings.TrimSpace(phaedrusLogin))
+	var latest time.Time
+
+	pr := resp.Data.Repository.PullRequest
+
+	// Issue comments
+	for _, node := range pr.Comments.Nodes {
+		if strings.ToLower(strings.TrimSpace(node.Author.Login)) != login {
+			continue
+		}
+		t, err := time.Parse(time.RFC3339, node.CreatedAt)
+		if err != nil {
+			continue
+		}
+		if t.After(latest) {
+			latest = t
+		}
+	}
+
+	// Reviews
+	for _, node := range pr.Reviews.Nodes {
+		if strings.ToLower(strings.TrimSpace(node.Author.Login)) != login {
+			continue
+		}
+		t, err := time.Parse(time.RFC3339, node.SubmittedAt)
+		if err != nil {
+			continue
+		}
+		if t.After(latest) {
+			latest = t
+		}
+	}
+
+	// Commits — check the commit author's user login
+	for _, node := range pr.Commits.Nodes {
+		if node.Author.User == nil {
+			continue
+		}
+		if strings.ToLower(strings.TrimSpace(node.Author.User.Login)) != login {
+			continue
+		}
+		t, err := time.Parse(time.RFC3339, node.Commit.CommittedDate)
+		if err != nil {
+			continue
+		}
+		if t.After(latest) {
+			latest = t
+		}
+	}
+
+	// latest is zero if phaedrusLogin had no activity
+	return latest, nil
 }
 
 func sortByUpdatedAtDesc(prs []searchPR) {
