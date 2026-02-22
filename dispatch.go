@@ -1,9 +1,11 @@
 package main
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 )
@@ -63,8 +65,13 @@ type ciFixContext struct {
 }
 
 type outputContract struct {
-	Format string   `json:"format"`
-	Fields []string `json:"fields"`
+	Format          string   `json:"format"`
+	Fields          []string `json:"fields"`
+	ActionTaken     string   `json:"action_taken,omitempty"`
+	Commits         []string `json:"commits,omitempty"`
+	ThreadsResolved int      `json:"threads_resolved,omitempty"`
+	IssuesCreated   int      `json:"issues_created,omitempty"`
+	Notes           string   `json:"notes,omitempty"`
 }
 
 // buildCIFixEnvelope constructs the Contract A envelope for the CI-fix subagent.
@@ -291,3 +298,108 @@ Hard rules:
 	}
 	return nil
 }
+
+// spawnReviewFixSubagent dispatches a subagent to fix review comments on a PR.
+// It uses Contract C and includes skill context from the skill dir.
+func spawnReviewFixSubagent(pr searchPR, branch string, reviews []prReview, skillDir string) error {
+	// Build skill context
+	skillCtx := buildReviewSkillContext(skillDir)
+
+	// Build the review context for the subagent
+	var reviewItems []map[string]string
+	for _, r := range reviews {
+		reviewItems = append(reviewItems, map[string]string{
+			"author":  r.Author.Login,
+			"state":   r.State,
+			"body":    r.Body,
+			"severity": classifyReviewSeverity(r.Body),
+		})
+	}
+
+	// Build contract payload
+	contract := reviewFixEnvelope{
+		Task:       "Fix review comments on PR. Analyze the review feedback and address all critical, major, and high-severity issues.",
+		Repo:       pr.Repository.NameWithOwner,
+		PRNumber:   pr.Number,
+		PRURL:       pr.URL,
+		Branch:     branch,
+		BaseBranch: "main",
+		Context: reviewFixContext{
+			Reviews:       reviewItems,
+			PRTitle:       pr.Title,
+			PRBody:        pr.Body,
+		},
+		SkillFiles: reviewFixSkillNames,
+		OutputContract: outputContract{
+			Format: "json",
+			Fields:  []string{"status", "summary", "artifacts"},
+		},
+	}
+
+	// Serialize and invoke
+	contractJSON, err := json.Marshal(contract)
+	if err != nil {
+		return fmt.Errorf("marshal contract: %w", err)
+	}
+
+	// Build the agent command
+	contractB64 := base64.StdEncoding.EncodeToString(contractJSON)
+	cmd := exec.Command("openclaw", "agent", "run",
+		"--model", "openrouter/x-ai/grok-code-fast-1",
+		"--system-prompt", skillCtx,
+		"--prompt", "You are fixing review comments on PR "+pr.URL+". Contract: "+contractB64+". Output JSON: {\"status\":\"success\",\"summary\":\"...\",\"artifacts\":\"...\"}",
+	)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
+}
+
+// classifyReviewSeverity returns a severity classification based on review body keywords.
+func classifyReviewSeverity(body string) string {
+	bodyLower := strings.ToLower(body)
+	if strings.Contains(bodyLower, "critical") || strings.Contains(bodyLower, "blocking") || strings.Contains(bodyLower, "must fix") {
+		return "critical"
+	}
+	if strings.Contains(bodyLower, "major") || strings.Contains(bodyLower, "high") || strings.Contains(bodyLower, "security") {
+		return "major"
+	}
+	if strings.Contains(bodyLower, "medium") || strings.Contains(bodyLower, "warning") {
+		return "minor"
+	}
+	return "nitpick"
+}
+
+// reviewFixContext contains the PR review data for the subagent.
+type reviewFixContext struct {
+	Reviews                []map[string]string `json:"reviews"`
+	PRTitle                string              `json:"pr_title"`
+	PRBody                 string              `json:"pr_body"`
+	ReviewCommentsSummary  string              `json:"review_comments_summary"`
+	OpenThreadCount        int                 `json:"open_thread_count"`
+}
+
+// reviewFixEnvelope is the Contract C JSON envelope for review-fix dispatch.
+type reviewFixEnvelope struct {
+	Task           string              `json:"task"`
+	Repo           string              `json:"repo"`
+	PRNumber       int                 `json:"pr_number"`
+	PRURL          string              `json:"pr_url"`
+	Branch         string              `json:"branch"`
+	BaseBranch     string              `json:"base_branch"`
+	Context        reviewFixContext    `json:"context"`
+	SkillFiles     []string            `json:"skill_files"`
+	OutputContract outputContract      `json:"output_contract"`
+}
+
+// reviewFixSkillNames lists the skill files for the review-fix subagent.
+var reviewFixSkillNames = []string{
+	"address-review/SKILL.md",
+	"code-review-checklist/SKILL.md",
+	"review-and-fix/SKILL.md",
+}
+
+// buildReviewSkillContext reads review-fix skill files from skillDir and returns a concatenated string.
+func buildReviewSkillContext(skillDir string) string {
+	return buildSkillContext(skillDir) // Use existing function for now
+}
+
