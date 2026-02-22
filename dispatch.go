@@ -395,3 +395,23 @@ var reviewFixSkillNames = []string{
 func buildReviewSkillContext(skillDir string) string {
 	return buildSkillContext(skillDir) // Use existing function for now
 }
+
+// buildReviewFixEnvelope constructs the Contract C envelope for review-fix dispatch.
+func buildReviewFixEnvelope(repo string, prNumber int, prURL, branch string, reviews []prReview, skillDir string) reviewFixEnvelope {
+	return reviewFixEnvelope{
+		Task:       "Fix review comments",
+		Repo:       repo,
+		PRNumber:   prNumber,
+		PRURL:      prURL,
+		Branch:     branch,
+		BaseBranch: "main",
+		Context: reviewFixContext{
+			Reviews: []map[string]string{},
+		},
+		SkillFiles: reviewFixSkillNames,
+		OutputContract: outputContract{
+			Format: "json",
+			Fields: []string{"status", "summary"},
+		},
+	}
+}
