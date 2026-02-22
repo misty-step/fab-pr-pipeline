@@ -143,6 +143,57 @@ type statusRollupEntry struct {
 	State      string `json:"state"`      // StatusContext
 }
 
+// prReview represents a single review on a pull request.
+// Used for severity classification and review-fix dispatch.
+type prReview struct {
+	State  string `json:"state"`  // "CHANGES_REQUESTED", "APPROVED", "COMMENTED", etc.
+	Body   string `json:"body"`
+	Author struct {
+		Login string `json:"login"`
+	} `json:"author"`
+}
+
+// reviewHasActionableBlockers returns true if any review has state==CHANGES_REQUESTED
+// AND body contains severity keywords indicating critical/major/high/security findings.
+//
+// Cerberus (github-actions bot) posts as a reviewer but its severity signal comes
+// from reviewDecision on the PR, not from individual review bodies. Individual
+// github-actions reviews are therefore excluded from keyword matching — the caller
+// is responsible for checking reviewDecision == "APPROVED" before calling this.
+//
+// Returns false for nitpick-only or INFO/WARN-only reviews so the pipeline does
+// not dispatch a subagent for trivial style feedback.
+func reviewHasActionableBlockers(reviews []prReview) bool {
+	// These keywords indicate severity that warrants automated dispatch.
+	actionableKeywords := []string{
+		"critical",
+		"major",
+		"high",
+		"security",
+		"FAIL",
+		"blocking",
+		"must fix",
+		"must-fix",
+	}
+	for _, r := range reviews {
+		if strings.ToUpper(strings.TrimSpace(r.State)) != "CHANGES_REQUESTED" {
+			continue
+		}
+		// Skip Cerberus / github-actions reviews — their severity is in reviewDecision,
+		// not in the review body. Individual body parsing would be noisy here.
+		if strings.EqualFold(strings.TrimSpace(r.Author.Login), "github-actions") {
+			continue
+		}
+		bodyLower := strings.ToLower(r.Body)
+		for _, kw := range actionableKeywords {
+			if strings.Contains(bodyLower, strings.ToLower(kw)) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 type runOutput struct {
 	Ok         bool        `json:"ok"`
 	Error      string      `json:"error,omitempty"`
@@ -469,6 +520,68 @@ func main() {
 			continue
 		}
 
+		// Handle CHANGES_REQUESTED: dispatch review-fix subagent if there are
+		// actionable (critical/major/high/security) blockers in the review feedback.
+		// R2.4: Only dispatch for critical/major/high/security findings — skip nitpick-only.
+		// Hard rule: one dispatch per PR per run — skip if CI-fix or conflict already dispatched.
+		if mergeReason == "review_changes_requested" {
+			if *dryRun {
+				outcome.Action = "skipped"
+				outcome.Reason = "dry_run_" + mergeReason
+				out.Results = append(out.Results, outcome)
+				cb.RecordSuccess(pr.URL)
+				continue
+			}
+
+			// reviewDecision is the authoritative gate — if APPROVED, skip.
+			// (mergeReason == "review_changes_requested" implies CHANGES_REQUESTED,
+			// but be defensive in case state changed between mergeAllowed check and now.)
+			if strings.ToUpper(strings.TrimSpace(view.ReviewDecision)) != "CHANGES_REQUESTED" {
+				// State changed; fall through to generic handling.
+				goto fallthrough_review
+			}
+
+			// Fetch structured reviews to classify severity.
+			reviews, reviewsErr := ghPRReviews(view.URL)
+			if reviewsErr != nil {
+				fmt.Fprintf(os.Stderr, "[review-fix] failed to fetch reviews for %s: %v\n", view.URL, reviewsErr)
+				// Degrade: fetch raw comments for Discord alerting (v1 behavior), skip dispatch.
+				comments, _ := ghPRReviewComments(view.URL)
+				outcome.ReviewComments = comments
+				outcome.Action = "review_dispatched"
+				outcome.Reason = mergeReason
+				cb.RecordSuccess(pr.URL)
+				out.Results = append(out.Results, outcome)
+				continue
+			}
+
+			if !reviewHasActionableBlockers(reviews) {
+				// Nitpick-only or INFO/WARN-only — non-blocking. Log and skip dispatch.
+				fmt.Fprintf(os.Stderr, "[review-fix] no actionable blockers in reviews for %s (nitpick-only), skipping dispatch\n", view.URL)
+				outcome.Action = "skipped"
+				outcome.Reason = "review_nitpick_only"
+				cb.RecordSuccess(pr.URL)
+				out.Results = append(out.Results, outcome)
+				continue
+			}
+
+			// Actionable blockers found — dispatch review-fix subagent.
+			dispErr := spawnReviewFixSubagent(pr, strings.TrimSpace(view.HeadRefName), reviews, *skillDir)
+			if dispErr != nil {
+				fmt.Fprintf(os.Stderr, "[review-fix] dispatch failed for %s: %v\n", view.URL, dispErr)
+				cb.RecordFailure(pr.URL)
+				outcome.Action = "error"
+				outcome.Reason = "review_fix_dispatch_failed: " + dispErr.Error()
+			} else {
+				outcome.Action = "review_fix_dispatched"
+				outcome.Reason = mergeReason
+				cb.RecordSuccess(pr.URL)
+			}
+			out.Results = append(out.Results, outcome)
+			continue
+		}
+	fallthrough_review:
+
 		// Skip archived repos - they're read-only and can't accept comments.
 		// Uses batch-fetched archived repo set (fetched once at startup).
 		// If batch fetch failed (archivedRepos == nil), allow pipeline to continue.
@@ -656,7 +769,7 @@ func summarize(results []prOutcome) (merged int, commented int, skipped int, err
 		switch r.Action {
 		case "merged":
 			merged++
-		case "commented", "review_dispatched", "lint_dispatched", "ci_fix_dispatched":
+		case "commented", "review_dispatched", "lint_dispatched", "ci_fix_dispatched", "review_fix_dispatched":
 			commented++
 		case "skipped":
 			skipped++
@@ -1050,6 +1163,30 @@ func ghPRReviewComments(url string) (string, error) {
 		return "", nil
 	}
 	return strings.Join(filtered, "\n\n"), nil
+}
+
+// ghPRReviews fetches structured review data (state, body, author) for a PR.
+// Returns all reviews including APPROVED, COMMENTED, and CHANGES_REQUESTED.
+// Used by reviewHasActionableBlockers to classify severity.
+func ghPRReviews(url string) ([]prReview, error) {
+	if strings.TrimSpace(url) == "" {
+		return nil, errors.New("pr url required")
+	}
+	args := []string{
+		"pr", "view", url,
+		"--json", "reviews",
+	}
+	stdout, err := runCmd("gh", args...)
+	if err != nil {
+		return nil, err
+	}
+	var v struct {
+		Reviews []prReview `json:"reviews"`
+	}
+	if err := json.Unmarshal(stdout, &v); err != nil {
+		return nil, fmt.Errorf("parse gh pr reviews json: %w", err)
+	}
+	return v.Reviews, nil
 }
 
 type repoInfo struct {
