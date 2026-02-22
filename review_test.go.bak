@@ -379,8 +379,7 @@ exit 0
 
 // TestBuildReviewSkillContext verifies that buildReviewSkillContext reads review-fix
 // skill files and produces a concatenated context string.
-func TestBuildReviewSkillContext(t *testing.T) { t.Skip("temporarily skipped"); return
-
+func TestBuildReviewSkillContext(t *testing.T) {
 	tmpDir := t.TempDir()
 
 	// Create mock review skill files.

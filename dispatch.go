@@ -65,8 +65,13 @@ type ciFixContext struct {
 }
 
 type outputContract struct {
-	Format string   `json:"format"`
-	Fields []string `json:"fields"`
+	Format          string   `json:"format"`
+	Fields          []string `json:"fields"`
+	ActionTaken     string   `json:"action_taken,omitempty"`
+	Commits         []string `json:"commits,omitempty"`
+	ThreadsResolved int      `json:"threads_resolved,omitempty"`
+	IssuesCreated   int      `json:"issues_created,omitempty"`
+	Notes           string   `json:"notes,omitempty"`
 }
 
 // buildCIFixEnvelope constructs the Contract A envelope for the CI-fix subagent.
@@ -366,9 +371,11 @@ func classifyReviewSeverity(body string) string {
 
 // reviewFixContext contains the PR review data for the subagent.
 type reviewFixContext struct {
-	Reviews       []map[string]string `json:"reviews"`
-	PRTitle       string              `json:"pr_title"`
-	PRBody        string              `json:"pr_body"`
+	Reviews                []map[string]string `json:"reviews"`
+	PRTitle                string              `json:"pr_title"`
+	PRBody                 string              `json:"pr_body"`
+	ReviewCommentsSummary  string              `json:"review_comments_summary"`
+	OpenThreadCount        int                 `json:"open_thread_count"`
 }
 
 // reviewFixEnvelope is the Contract C JSON envelope for review-fix dispatch.
