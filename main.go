@@ -1113,7 +1113,8 @@ func ghPRUpdateBranch(url string) error {
 
 // ghPRComments fetches the most recent 100 comment bodies from a PR, ordered newest first.
 // 100 is sufficient for dedup purposes and avoids unbounded fetching on high-traffic PRs.
-func ghPRComments(url string) ([]string, error) {
+// DEPRECATED: not used in v2 dispatch flow, kept for reference
+func XghPRComments(url string) ([]string, error) {
 	if strings.TrimSpace(url) == "" {
 		return nil, errors.New("pr url required")
 	}
